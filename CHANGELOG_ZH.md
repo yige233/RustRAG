@@ -6,6 +6,57 @@ RustRAG 全部重要版本变更记录。
 
 ---
 
+## v3.1.0 — 正确性与并发加固
+
+系统性修复 v3.0.0 审查问题，补齐关系抽取链路，并强化检索/安全边界。
+
+### 功能补齐
+
+- **代码关系真正可用**：索引代码文件时抽取 calls / imports / inherits，写入 `code_relations`；`search_relations` 不再恒空。关系按**最内层符号**归属，避免 class/method 双重计数。
+- **ESM/CJS 变体可索引**：`.mjs` / `.cjs` / `.mts` / `.cts` 正确路由为 Code（此前 allowlist 命中却全部 failed）。
+- **向量 KNN 检索**：改用 sqlite-vec `embedding MATCH ... k = N`，有过滤时 over-fetch 再 LIMIT，避免全表暴力排序。
+- **`embedding.max_concurrent` 生效**：按波次并发请求 Embedding API。
+- **词典二次抽取**：`build_dictionary` 额外从「中文注释 + 符号」提取映射。
+
+### 可靠性
+
+- Embedder 初始化失败**不再静默回退 Mock**，search/index 返回明确错误。
+- `manage_document` 删除不存在文档时返回失败，不再假成功。
+- `Db::open` 按配置维度建表；从 metadata 与已有 `vec_chunks` schema 校验维度，不匹配拒绝启动。
+- 单文件索引与目录同步统一路径规范化（`normalize_system_path`）。
+- 数据目录创建失败直接退出；批量 index 返回每文件错误详情。
+
+### 安全
+
+- MCP `index` / `frontmatter` 路径限制在 `document_patterns` 基目录内（Windows 大小写不敏感）。
+- frontmatter 不存在文件先报 `file not found`。
+
+### 清理
+
+- 移除已废弃的 `compute` / `model` 配置段（旧 JSON 字段会被忽略）。
+- `updater` 缓存目录改为 `data_dir`（此前误用 `db_path` 文件路径）。
+- HTTP 日志与实际 bind 一致（`127.0.0.1`）；PDF 抽取页数上限 500。
+- `bin/query` 改为 CLI 参数；架构文档与 README 同步到 API Embedder。
+
+### 迁移说明
+
+从 v3.0.0 升级通常**无需**删除 `vectors.db`（仍为 1024 维）。若曾用其它 `dimensions` 建库，请保持配置一致或删除库重建。旧配置中的 `compute` / `model` 可删可留。
+
+---
+
+## v3.0.0 — Embedding API 重构
+
+将本地 ONNX 推理引擎替换为 **OpenAI 兼容 Embedding API**。
+
+- **API 向量化**：支持 DashScope、Ollama、OpenAI、Azure OpenAI 等 `/v1/embeddings`。
+- **1024 维向量**（默认），秒级启动，运行时内存约 50MB。
+- 移除 `ort`、`tokenizers`、`bytemuck`、`indicatif`。
+- 智能批处理 + 指数退避重试；数据目录默认 `~/.rustrag/`。
+
+**破坏性变更**（自 v2.x）：删除旧 `vectors.db`；配置改为 `embedding` 段；移除 `compute` / `model`。
+
+---
+
 ## v2.4.3 — sqlite-vec 初始化顺序修复
 
 修复 sqlite-vec 自动扩展注册顺序 —— 将 `sqlite3_auto_extension` 调用移至 `Connection::open()` **之前**，确保 r2d2 连接池中每个连接都正确加载扩展。

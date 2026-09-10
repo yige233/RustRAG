@@ -216,6 +216,26 @@ impl Db {
         Ok(results)
     }
 
+    /// Returns distinct symbol names recorded for an indexed document.
+    pub fn get_symbols_for_document(&self, filename: &str) -> Result<Vec<String>> {
+        let conn = self.get_conn()?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT DISTINCT cm.symbol_name
+            FROM code_metadata cm
+            JOIN chunks c ON cm.chunk_id = c.id
+            JOIN documents d ON c.document_id = d.id
+            WHERE d.filename = ? AND cm.symbol_name IS NOT NULL AND cm.symbol_name != ''
+            "#,
+        )?;
+        let rows = stmt.query_map([filename], |row| row.get::<_, String>(0))?;
+        let mut symbols = Vec::new();
+        for row in rows {
+            symbols.push(row?);
+        }
+        Ok(symbols)
+    }
+
     /// Looks up target words for a source word (Word Mapping dictionary)
     pub fn lookup_word_mappings(
         &self,

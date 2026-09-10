@@ -8,15 +8,15 @@
 
 RustRAG 是一个使用 Rust 编写的高性能检索增强生成 (RAG) MCP (Model Context Protocol) 服务器。
 
-> **为您的大模型缩减高达 40 倍的 Token 消耗** —— 构建代码库和文档的 1024 维向量索引，确保 AI 助手仅获取最核心、最高相关的知识片段。
+> **为您的大模型缩减高达 40 倍的 Token 消耗** —— 构建代码库和文档的向量索引（默认 1024 维，可配置），确保 AI 助手仅获取最核心、最高相关的知识片段。
 
 ---
 
-## 最新版本 (v3.0.0)
+## 最新版本 (v3.1.0)
 
-v3.0.0 是一次重大重构版本，将本地 ONNX 推理引擎替换为 **OpenAI 兼容的 Embedding API** 后端，带来更高的检索精度和极简的部署体验。
+v3.1.0 在 v3.0.0（Embedding API 重构）基础上做正确性与并发加固：代码关系抽取已接线、ESM/CJS 变体可索引、向量检索改用 sqlite-vec KNN、Embedder 失败不再静默降级。
 
-### 核心变更
+### v3.0.0 核心变更（API 向量化）
 
 - **API 向量化** — 从本地 ONNX 模型（~235MB 下载、~500MB 内存）切换到任意 OpenAI 兼容的 `/v1/embeddings` API。支持 DashScope、Ollama、OpenAI、Azure OpenAI 等。
 - **1024 维向量** — 从 384 维升级到 1024 维（float32），语义检索精度大幅提升。
@@ -35,7 +35,11 @@ v3.0.0 是一次重大重构版本，将本地 ONNX 推理引擎替换为 **Open
 1. 删除旧的 `vectors.db`（schema 不兼容：384 vs 1024 维）
 2. 更新 `config.json`，添加新的 `embedding` 配置段（参见[快速开始](#2-配置)）
 3. 通过配置文件或环境变量设置 API Key（`RAG_API_KEY`、`DASHSCOPE_API_KEY` 或 `OPENAI_API_KEY`）
-4. 从配置中移除 `compute` 和 `model` 段（已不再使用）
+4. 从配置中移除 `compute` 和 `model` 段（已不再使用；v3.1.0 起会被忽略）
+
+### 从 v3.0.0 升级到 v3.1.0
+
+通常**无需**删除 `vectors.db`。保持 `embedding.dimensions` 与建库时一致即可；维度不匹配会在启动时明确报错。
 
 [📋 完整更新日志](CHANGELOG_ZH.md)
 
@@ -45,10 +49,11 @@ v3.0.0 是一次重大重构版本，将本地 ONNX 推理引擎替换为 **Open
 
 - **7 个 MCP 工具** — search、index、list_documents、manage_document、frontmatter、search_relations、build_dictionary
 - **28 种支持格式** — 代码（Rust、Go、Python、TypeScript、JavaScript + ESM/CJS 变体）、Markdown、纯文本、结构化数据（JSON、YAML、TOML、CSV）、HTML、PDF、DOCX、电子表格
-- **1024 维向量搜索** — SQLite + sqlite-vec，float32 精度，高质量语义检索
-- **代码智能解析** — Tree-sitter AST 解析 Rust、Go、Python、TypeScript、JavaScript
-- **跨语种词典** — CJK↔English 符号映射提取
+- **KNN 向量搜索** — SQLite + sqlite-vec，`float32` 维度可配置（默认 1024）
+- **代码智能解析** — Tree-sitter AST 分块 + calls/imports/inherits 关系抽取
+- **跨语种词典** — CJK↔English 符号映射提取（含注释邻近符号）
 - **任意 OpenAI 兼容 API** — DashScope、Ollama（本地）、OpenAI、Azure OpenAI、DeepSeek、SiliconFlow
+- **路径白名单** — MCP 文件工具限制在 `document_patterns` 内
 - **高并发稳定流** — 异步后台同步，支持 10k+ 文件的大项目
 - **全平台支持** — macOS (Intel/ARM)、Linux (x64/ARM64)、Windows (x64)
 
@@ -116,7 +121,7 @@ export OPENAI_API_KEY="sk-your-api-key"
 | DeepSeek | `https://api.deepseek.com/v1/embeddings` | `deepseek-embedding` | 1024 |
 | SiliconFlow | `https://api.siliconflow.cn/v1/embeddings` | `BAAI/bge-large-zh-v1.5` | 1024 |
 
-> **注意**：切换提供商时，需更新 `dimensions` 以匹配模型输出，并删除已有的 `vectors.db`（schema 必须匹配）。
+> **注意**：切换提供商时，需更新 `dimensions` 以匹配模型输出，并删除已有的 `vectors.db`（schema 会在打开时按 dimensions 创建，并写入 `system_metadata` 做一致性校验；维度不匹配会拒绝启动）。
 
 ### 3. 接入 MCP 客户端
 

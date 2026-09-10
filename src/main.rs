@@ -65,23 +65,21 @@ async fn main() -> Result<()> {
     // 3b. Check for updates (best-effort, errors silently ignored)
     if config.is_update_check_enabled() {
         let ver = updater::CURRENT_VERSION;
+        let cache_hint = config.data_dir.to_string_lossy().to_string();
         tokio::spawn(async move {
-            updater::check_for_update(ver, "").await;
+            updater::check_for_update(ver, &cache_hint).await;
         });
     }
 
     // 4. Ensure data directory exists
     let data_dir = &config.data_dir;
-    if let Err(e) = std::fs::create_dir_all(data_dir) {
-        tracing::warn!(
-            "Failed to create data directory {}: {e}",
-            data_dir.display()
-        );
-    }
+    std::fs::create_dir_all(data_dir)
+        .with_context(|| format!("failed to create data directory {}", data_dir.display()))?;
 
     // 5. Initialize database
     tracing::info!(db_path = %config.db_path, "Opening database");
-    let db = Db::open(&config.db_path).context("Failed to open database")?;
+    let db = Db::open(&config.db_path, config.embedding.dimensions)
+        .context("Failed to open database")?;
 
     // 6. Wrap db in Arc so MCP and sync can share it
     let db = Arc::new(db);
@@ -98,7 +96,13 @@ async fn main() -> Result<()> {
             tracing::info!(dirs = ?base_dirs, "Background sync started");
 
             // Trigger embedder lazy-init now (in background, not blocking MCP startup)
-            let sync_embedder = sync_ctx.get_embedder().await;
+            let sync_embedder = match sync_ctx.get_embedder().await {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::error!("Background sync aborted: {e}");
+                    return;
+                }
+            };
 
             for dir in &base_dirs {
                 if !dir.exists() {

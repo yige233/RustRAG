@@ -5,8 +5,9 @@ use crate::indexer::markdown;
 use chrono::{DateTime, Utc};
 use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// Normalizes a path to absolute format, stripping Windows UNC prefixes.
 pub fn normalize_system_path(path: &Path) -> String {
@@ -33,7 +34,9 @@ pub enum FileType {
 pub fn classify_extension(ext: &str) -> Option<FileType> {
     match ext {
         "md" => Some(FileType::Markdown),
-        "rs" | "go" | "py" | "js" | "ts" | "jsx" | "tsx" => Some(FileType::Code),
+        "rs" | "go" | "py" | "js" | "mjs" | "cjs" | "jsx" | "ts" | "mts" | "cts" | "tsx" => {
+            Some(FileType::Code)
+        }
         "txt" | "log" | "json" | "yaml" | "yml" | "toml" | "csv" | "html" | "htm" | "pdf"
         | "docx" | "xls" | "xlsx" | "xlsb" | "ods" => Some(FileType::Text),
         _ => None,
@@ -48,6 +51,108 @@ pub struct CodeSyncResult {
     pub added: usize,
     pub updated: usize,
     pub removed: usize,
+}
+
+/// Embed texts without blocking the Tokio worker when possible.
+///
+/// `block_in_place` panics on current-thread runtimes (unit tests), so fall
+/// back to a direct call there. Production `#[tokio::main]` is multi-thread.
+fn embed_batch_off_executor<E: Embedder + ?Sized>(
+    embedder: &E,
+    texts: &[&str],
+) -> Result<Vec<Vec<f32>>, crate::embedder::EmbedderError> {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| embedder.embed_batch(texts))
+        }
+        _ => embedder.embed_batch(texts),
+    }
+}
+
+/// Shared process-wide relation extractor (tree-sitter queries are expensive to compile).
+fn get_relation_extractor()
+-> Result<&'static crate::indexer::relations::RelationExtractor, Box<dyn std::error::Error>> {
+    use crate::indexer::relations::RelationExtractor;
+    static CELL: OnceLock<Result<RelationExtractor, String>> = OnceLock::new();
+    match CELL.get_or_init(|| RelationExtractor::new().map_err(|e| e.to_string())) {
+        Ok(extractor) => Ok(extractor),
+        Err(msg) => Err(msg.clone().into()),
+    }
+}
+
+/// Assign each relation line to the innermost symbol chunk that contains it.
+fn owning_chunk_index(
+    chunks: &[crate::indexer::code_parser::CodeChunk],
+    line: usize,
+) -> Option<usize> {
+    chunks
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| line >= c.start_line && line <= c.end_line)
+        .min_by_key(|(_, c)| c.end_line.saturating_sub(c.start_line))
+        .map(|(i, _)| i)
+}
+
+/// Extract call/import/inherit relations for a code file and insert them.
+///
+/// Relations are attributed once per edge, to the innermost enclosing symbol.
+/// `target_chunk_id` is resolved within the same file via a symbol→chunk map.
+pub fn store_code_file_relations(
+    db: &Db,
+    real_path: &Path,
+    db_path: &str,
+    code_chunks: &[crate::indexer::code_parser::CodeChunk],
+    chunk_ids: &[i64],
+) -> Result<usize, Box<dyn std::error::Error>> {
+    use crate::db::models::CodeRelation as DbRelation;
+
+    let Some(lang) = code_chunks.first().map(|c| c.language.as_str()) else {
+        return Ok(0);
+    };
+
+    let content = std::fs::read(real_path)?;
+    let extractor = get_relation_extractor()?;
+    let file_rels = extractor.extract_relations(&content, lang, db_path, "")?;
+
+    // symbol_name → chunk_id for same-file targets (avoids N+1 lookups)
+    let mut symbol_to_chunk: HashMap<&str, i64> = HashMap::new();
+    for (i, chunk) in code_chunks.iter().enumerate() {
+        if let Some(id) = chunk_ids.get(i) {
+            symbol_to_chunk
+                .entry(chunk.symbol_name.as_str())
+                .or_insert(*id);
+        }
+    }
+
+    let mut db_rels: Vec<DbRelation> = Vec::new();
+    for rel in &file_rels {
+        let Some(idx) = owning_chunk_index(code_chunks, rel.source_line) else {
+            continue;
+        };
+        let Some(&source_chunk_id) = chunk_ids.get(idx) else {
+            continue;
+        };
+        let chunk = &code_chunks[idx];
+        let target_chunk_id = symbol_to_chunk.get(rel.target_name.as_str()).copied();
+        db_rels.push(DbRelation {
+            id: 0,
+            source_chunk_id,
+            target_chunk_id,
+            relation_type: rel.relation_type.as_str().to_string(),
+            target_name: rel.target_name.clone(),
+            target_file: rel.target_file.clone(),
+            confidence: 1.0,
+            source_name: Some(chunk.symbol_name.clone()),
+            source_file: Some(db_path.to_string()),
+        });
+    }
+
+    let inserted = db_rels.len();
+    if !db_rels.is_empty() {
+        db.insert_relations(&db_rels)?;
+    }
+    Ok(inserted)
 }
 
 pub struct Indexer<'a, E: Embedder + ?Sized> {
@@ -167,18 +272,38 @@ impl<'a, E: Embedder + ?Sized> Indexer<'a, E> {
 
             if needs_indexing {
                 let success = match classify_extension(ext) {
-                    Some(FileType::Markdown) => {
-                        self.index_markdown(path, &path_str, mod_time).await.is_ok()
-                    }
+                    Some(FileType::Markdown) => self
+                        .index_markdown(path, &path_str, mod_time)
+                        .await
+                        .map_err(|e| {
+                            tracing::warn!(file = %path.display(), error = %e, "markdown index failed");
+                            e
+                        })
+                        .is_ok(),
                     Some(FileType::Code) => self
                         .index_code_file(path, &path_str, mod_time)
                         .await
+                        .map_err(|e| {
+                            tracing::warn!(file = %path.display(), error = %e, "code index failed");
+                            e
+                        })
                         .is_ok(),
                     Some(FileType::Text) => self
                         .index_text_file(path, &path_str, mod_time)
                         .await
+                        .map_err(|e| {
+                            tracing::warn!(file = %path.display(), error = %e, "text index failed");
+                            e
+                        })
                         .is_ok(),
-                    None => false,
+                    None => {
+                        tracing::debug!(
+                            file = %path.display(),
+                            ext = ext,
+                            "unsupported extension, skipping"
+                        );
+                        false
+                    }
                 };
 
                 if success {
@@ -262,8 +387,8 @@ impl<'a, E: Embedder + ?Sized> Indexer<'a, E> {
 
         let text_refs: Vec<&str> = chunks.iter().map(|c| c.content.as_str()).collect();
 
-        // Vectorize chunks
-        let vectors = self.embedder.embed_batch(&text_refs)?;
+        // Vectorize chunks (blocking HTTP — keep off the async executor)
+        let vectors = embed_batch_off_executor(self.embedder, &text_refs)?;
 
         // Map to models::Chunk for DB insertion
         let db_chunks: Vec<crate::db::models::Chunk> = chunks
@@ -287,7 +412,7 @@ impl<'a, E: Embedder + ?Sized> Indexer<'a, E> {
     ///
     /// Parses the file into symbol-level chunks (functions, classes, methods),
     /// generates embeddings from enriched text (`language symbol_name: content`),
-    /// and stores them with full code metadata.
+    /// stores them with full code metadata, then extracts and stores call/import/inherit relations.
     async fn index_code_file(
         &self,
         real_path: &Path,
@@ -306,8 +431,8 @@ impl<'a, E: Embedder + ?Sized> Indexer<'a, E> {
         let text_refs: Vec<String> = code_chunks.iter().map(|c| c.get_embedding_text()).collect();
         let text_str_refs: Vec<&str> = text_refs.iter().map(|s| s.as_str()).collect();
 
-        // Vectorize
-        let vectors = self.embedder.embed_batch(&text_str_refs)?;
+        // Vectorize (blocking HTTP — keep off the async executor)
+        let vectors = embed_batch_off_executor(self.embedder, &text_str_refs)?;
 
         // Convert indexer::CodeChunk → db::models::CodeChunk
         let db_chunks: Vec<crate::db::models::CodeChunk> = code_chunks
@@ -328,11 +453,12 @@ impl<'a, E: Embedder + ?Sized> Indexer<'a, E> {
             })
             .collect();
 
-        // Write to DB with code metadata
-        {
-            let db_guard = self.db.clone();
-            db_guard.insert_code_document(db_path, mod_time, &db_chunks, &vectors)?;
-        }
+        // Write to DB with code metadata; capture chunk IDs for relations
+        let chunk_ids = self
+            .db
+            .insert_code_document(db_path, mod_time, &db_chunks, &vectors)?;
+
+        store_code_file_relations(&self.db, real_path, db_path, &code_chunks, &chunk_ids)?;
 
         Ok(())
     }
@@ -351,7 +477,7 @@ impl<'a, E: Embedder + ?Sized> Indexer<'a, E> {
         }
 
         let text_refs: Vec<&str> = chunks.iter().map(|c| c.content.as_str()).collect();
-        let vectors = self.embedder.embed_batch(&text_refs)?;
+        let vectors = embed_batch_off_executor(self.embedder, &text_refs)?;
 
         let db_chunks: Vec<crate::db::models::Chunk> = chunks
             .iter()
@@ -378,7 +504,50 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
-    #[tokio::test]
+    #[test]
+    fn test_classify_extension_includes_esm_cjs_variants() {
+        assert_eq!(classify_extension("mjs"), Some(FileType::Code));
+        assert_eq!(classify_extension("cjs"), Some(FileType::Code));
+        assert_eq!(classify_extension("mts"), Some(FileType::Code));
+        assert_eq!(classify_extension("cts"), Some(FileType::Code));
+        assert_eq!(classify_extension("java"), None);
+    }
+
+    #[test]
+    fn test_owning_chunk_index_prefers_innermost_span() {
+        use crate::indexer::code_parser::CodeChunk;
+        let outer = CodeChunk {
+            content: String::new(),
+            position: 0,
+            symbol_name: "Foo".into(),
+            symbol_type: "class".into(),
+            language: "python".into(),
+            start_line: 1,
+            end_line: 20,
+            parent_symbol: None,
+            signature: String::new(),
+        };
+        let inner = CodeChunk {
+            content: String::new(),
+            position: 1,
+            symbol_name: "bar".into(),
+            symbol_type: "function".into(),
+            language: "python".into(),
+            start_line: 5,
+            end_line: 8,
+            parent_symbol: Some("Foo".into()),
+            signature: String::new(),
+        };
+        let chunks = vec![outer, inner];
+        // Line 6 is inside both; innermost (bar) wins
+        assert_eq!(owning_chunk_index(&chunks, 6), Some(1));
+        // Line 2 is only inside Foo
+        assert_eq!(owning_chunk_index(&chunks, 2), Some(0));
+        // Line 30 matches nothing
+        assert_eq!(owning_chunk_index(&chunks, 30), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_indexer_differential_sync() {
         let temp_dir = tempdir().unwrap();
         let dir_path = temp_dir.path();
@@ -423,5 +592,60 @@ mod tests {
         // Check DB
         let docs = db_arc.list_documents().unwrap();
         assert_eq!(docs.len(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_index_code_file_stores_relations() {
+        let temp_dir = tempdir().unwrap();
+        let file = temp_dir.path().join("sample.rs");
+        fs::write(
+            &file,
+            r#"
+fn helper() {}
+
+fn process() {
+    helper();
+    external_function();
+}
+"#,
+        )
+        .unwrap();
+
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let embedder = MockEmbedder::default();
+        let indexer = Indexer::new(
+            db.clone(),
+            &embedder,
+            500,
+            Arc::new(crate::config::Config::default()),
+        );
+
+        let path_str = normalize_system_path(&file);
+        indexer
+            .index_code_file(&file, &path_str, chrono::Utc::now())
+            .await
+            .expect("index code file");
+
+        let rels = db
+            .find_symbol_relations("helper", "incoming", Some("calls"))
+            .unwrap();
+        assert!(
+            !rels.is_empty(),
+            "process() should record a calls relation to helper"
+        );
+
+        // Each edge should be attributed once (no double-count from outer/inner)
+        let process_out = db
+            .find_symbol_relations("process", "outgoing", Some("calls"))
+            .unwrap();
+        let helper_targets: Vec<_> = process_out
+            .iter()
+            .filter(|r| r.target_name == "helper")
+            .collect();
+        assert_eq!(
+            helper_targets.len(),
+            1,
+            "helper call must be attributed exactly once"
+        );
     }
 }

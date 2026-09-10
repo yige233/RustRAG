@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tempfile::tempdir;
 
 /// Full pipeline: create docs → index → list → search → delete
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_full_pipeline() {
     // 1. Setup temp dir with test markdown files
     let temp_dir = tempdir().unwrap();
@@ -175,6 +175,7 @@ fn test_frontmatter_round_trip() {
         language: "rust".to_string(),
         tags: vec!["test".to_string(), "integration".to_string()],
         project: "rustrag".to_string(),
+        extra: vec![],
     };
 
     rustrag::frontmatter::add_frontmatter(&file_path, &metadata).unwrap();
@@ -199,6 +200,7 @@ fn test_frontmatter_round_trip() {
         language: "typescript".to_string(),
         tags: vec!["updated".to_string()],
         project: "new-project".to_string(),
+        extra: vec![],
     };
 
     rustrag::frontmatter::update_frontmatter(&file_path, &updated_metadata).unwrap();

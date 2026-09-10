@@ -11,10 +11,7 @@
 use crate::db::search::SearchFilter;
 use crate::frontmatter;
 use crate::indexer::core::{FileType, Indexer, classify_extension};
-use crate::indexer::{
-    code_parser::CodeParser,
-    dictionary::{self, DictionaryExtractor},
-};
+use crate::indexer::dictionary::{self, DictionaryExtractor};
 use crate::mcp::server::McpContext;
 use rmcp::handler::server::ServerHandler;
 use rmcp::handler::server::wrapper::Parameters;
@@ -183,7 +180,11 @@ impl AppTools {
         let top_k = p.top_k.unwrap_or(5);
 
         // Pre-clone context limits
-        let embedder = self.ctx.get_embedder().await;
+        let embedder = self
+            .ctx
+            .get_embedder()
+            .await
+            .map_err(|e| McpError::internal_error(e, None))?;
         let db = self.ctx.db.clone();
 
         let query_str = p.query.clone();
@@ -220,8 +221,11 @@ impl AppTools {
         // Check for updates (non-blocking, best-effort)
         let config_guard = self.ctx.config.read().await;
         let update_info = if config_guard.is_update_check_enabled() {
-            crate::updater::get_update_info(crate::updater::CURRENT_VERSION, &config_guard.db_path)
-                .await
+            crate::updater::get_update_info(
+                crate::updater::CURRENT_VERSION,
+                &config_guard.data_dir.to_string_lossy(),
+            )
+            .await
         } else {
             None
         };
@@ -312,9 +316,13 @@ impl AppTools {
                         success_count += 1;
                         results.push(serde_json::json!({"file": f, "success": true}));
                     }
-                    Err(_) => {
+                    Err(e) => {
                         error_count += 1;
-                        results.push(serde_json::json!({"file": f, "success": false}));
+                        results.push(serde_json::json!({
+                            "file": f,
+                            "success": false,
+                            "error": e.to_string(),
+                        }));
                     }
                 }
             }
@@ -330,7 +338,7 @@ impl AppTools {
 
         // Directory indexing — delegate to Indexer to avoid duplicating walker logic
         if let Some(dir) = &p.directory {
-            // Security validation: ensure directory exists and is within allowed paths
+            // Security: path must exist and lie under configured document_patterns
             let dir_path = Path::new(dir);
             if !dir_path.exists() {
                 return error_result(&format!("Directory does not exist: {}", dir));
@@ -352,9 +360,19 @@ impl AppTools {
                 }
             };
 
-            let force = p.force.unwrap_or(false);
-            let embedder = self.ctx.get_embedder().await;
             let config = self.ctx.config.read().await.clone();
+            if !config.is_path_allowed(dir_path) {
+                return error_result(&format!(
+                    "Directory is outside configured document_patterns: {dir}"
+                ));
+            }
+
+            let force = p.force.unwrap_or(false);
+            let embedder = self
+                .ctx
+                .get_embedder()
+                .await
+                .map_err(|e| McpError::internal_error(e, None))?;
             let mut indexer = Indexer::new(
                 self.ctx.db.clone(),
                 embedder.as_ref(),
@@ -441,10 +459,14 @@ impl AppTools {
             "delete" => {
                 let db = self.ctx.db.clone();
                 let f_clone = p.filename.clone();
-                tokio::task::spawn_blocking(move || db.delete_document(&f_clone))
+                let deleted = tokio::task::spawn_blocking(move || db.delete_document(&f_clone))
                     .await
                     .map_err(|e| McpError::internal_error(format!("blocking failed: {e}"), None))?
                     .map_err(|e| McpError::internal_error(format!("delete failed: {e}"), None))?;
+
+                if !deleted {
+                    return error_result(&format!("document not found in index: {}", p.filename));
+                }
 
                 json_result(serde_json::json!({
                     "success": true,
@@ -453,6 +475,15 @@ impl AppTools {
                 }))
             }
             "reindex" => {
+                // Ensure the source file exists before dropping the index entry
+                let path = Path::new(&p.filename);
+                if !path.exists() {
+                    return Err(McpError::invalid_params(
+                        format!("file not found: {}", p.filename),
+                        None,
+                    ));
+                }
+
                 // Delete from DB
                 {
                     let db = self.ctx.db.clone();
@@ -468,14 +499,6 @@ impl AppTools {
                 }
 
                 // Re-index
-                let path = Path::new(&p.filename);
-                if !path.exists() {
-                    return Err(McpError::invalid_params(
-                        format!("file not found: {}", p.filename),
-                        None,
-                    ));
-                }
-
                 index_single_file(path, &p.filename, &self.ctx).await?;
 
                 json_result(serde_json::json!({
@@ -508,12 +531,32 @@ impl AppTools {
             ));
         }
 
+        let file_path = Path::new(&p.filepath);
+        if !file_path.exists() {
+            return Err(McpError::invalid_params(
+                format!("file not found: {}", p.filepath),
+                None,
+            ));
+        }
+        {
+            let config = self.ctx.config.read().await;
+            if !config.is_path_allowed(file_path) {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "path is outside configured document_patterns: {}",
+                        p.filepath
+                    ),
+                    None,
+                ));
+            }
+        }
+
         let metadata = build_frontmatter_metadata(&p);
         let mode = p.mode.as_deref().unwrap_or("update");
 
         match mode {
             "add" => {
-                frontmatter::add_frontmatter(Path::new(&p.filepath), &metadata)
+                frontmatter::add_frontmatter(file_path, &metadata)
                     .map_err(|e| McpError::internal_error(format!("{e}"), None))?;
                 json_result(serde_json::json!({
                     "success": true,
@@ -522,7 +565,7 @@ impl AppTools {
                 }))
             }
             "update" => {
-                frontmatter::update_frontmatter(Path::new(&p.filepath), &metadata)
+                frontmatter::update_frontmatter(file_path, &metadata)
                     .map_err(|e| McpError::internal_error(format!("{e}"), None))?;
                 json_result(serde_json::json!({
                     "success": true,
@@ -600,11 +643,23 @@ impl AppTools {
         params: Parameters<BuildDictionaryParams>,
     ) -> Result<CallToolResult, McpError> {
         let p = params.0;
-        let source_lang = p.source_lang.as_deref().unwrap_or("ja");
+        let source_lang = p.source_lang.as_deref().unwrap_or("zh");
         let limit = p.limit.unwrap_or(100);
 
         let extractor = DictionaryExtractor::new();
         let mut all_mappings: Vec<(String, String, String, f64, String)> = Vec::new();
+
+        let push_mappings = |mappings: Vec<dictionary::WordMapping>, all: &mut Vec<_>| {
+            for m in mappings {
+                all.push((
+                    m.source_word,
+                    m.target_word,
+                    m.source_lang.clone(),
+                    m.confidence as f64,
+                    m.source_document.clone(),
+                ));
+            }
+        };
 
         if let Some(doc_path) = &p.document {
             // Validate the document is indexed before reading
@@ -630,14 +685,25 @@ impl AppTools {
                 McpError::invalid_params(format!("failed to read {doc_path}: {e}"), None)
             })?;
             let mappings = extractor.extract_from_content(&content, doc_path, source_lang);
-            for m in mappings {
-                all_mappings.push((
-                    m.source_word,
-                    m.target_word,
-                    m.source_lang.clone(),
-                    m.confidence as f64,
-                    m.source_document.clone(),
-                ));
+            push_mappings(mappings, &mut all_mappings);
+
+            // Also mine comment/symbol pairs when the document has code metadata
+            let db = self.ctx.db.clone();
+            let doc_path_clone = doc_path.clone();
+            let symbols = tokio::task::spawn_blocking(move || {
+                db.get_symbols_for_document(&doc_path_clone)
+                    .unwrap_or_default()
+            })
+            .await
+            .unwrap_or_default();
+            if !symbols.is_empty() {
+                let more = extractor.extract_from_symbols_and_comments(
+                    &content,
+                    &symbols,
+                    doc_path,
+                    source_lang,
+                );
+                push_mappings(more, &mut all_mappings);
             }
         } else {
             // Extract from all indexed documents
@@ -658,15 +724,26 @@ impl AppTools {
                 let lang = dictionary::detect_language(&content);
                 if lang == "mixed" || lang == source_lang {
                     let mappings = extractor.extract_from_content(&content, doc_path, source_lang);
-                    for m in mappings {
-                        all_mappings.push((
-                            m.source_word,
-                            m.target_word,
-                            m.source_lang.clone(),
-                            m.confidence as f64, // Cast f32 to f64
-                            m.source_document.clone(),
-                        ));
-                    }
+                    push_mappings(mappings, &mut all_mappings);
+                }
+
+                // Code documents: also extract from Chinese comments near symbols
+                let db = self.ctx.db.clone();
+                let doc_path_clone = doc_path.clone();
+                let symbols = tokio::task::spawn_blocking(move || {
+                    db.get_symbols_for_document(&doc_path_clone)
+                        .unwrap_or_default()
+                })
+                .await
+                .unwrap_or_default();
+                if !symbols.is_empty() {
+                    let more = extractor.extract_from_symbols_and_comments(
+                        &content,
+                        &symbols,
+                        doc_path,
+                        source_lang,
+                    );
+                    push_mappings(more, &mut all_mappings);
                 }
             }
         }
@@ -680,7 +757,8 @@ impl AppTools {
                     McpError::internal_error(format!("insert mappings failed: {e}"), None)
                 })?;
             }
-            Ok::<_, McpError>(db.get_word_mapping_count().unwrap_or(0))
+            db.get_word_mapping_count()
+                .map_err(|e| McpError::internal_error(format!("count mappings failed: {e}"), None))
         })
         .await
         .map_err(|e| McpError::internal_error(format!("blocking failed: {e}"), None))??;
@@ -721,6 +799,7 @@ fn build_frontmatter_metadata(p: &FrontmatterParams) -> frontmatter::Metadata {
         language: p.language.clone().unwrap_or_default(),
         tags,
         project: p.project.clone().unwrap_or_default(),
+        extra: vec![],
     }
 }
 
@@ -733,6 +812,14 @@ async fn index_single_file(
     if !path.exists() {
         return Err(McpError::invalid_params(
             format!("file not found: {filepath}"),
+            None,
+        ));
+    }
+
+    let config = ctx.config.read().await.clone();
+    if !config.is_path_allowed(path) {
+        return Err(McpError::invalid_params(
+            format!("path is outside configured document_patterns: {filepath}"),
             None,
         ));
     }
@@ -760,6 +847,11 @@ async fn index_single_file(
     }
 }
 
+/// Normalize a filesystem path the same way the directory indexer does.
+fn normalize_db_path(path: &Path) -> String {
+    crate::indexer::core::normalize_system_path(path)
+}
+
 /// Index a single markdown file.
 async fn index_single_markdown_file(
     path: &Path,
@@ -776,8 +868,11 @@ async fn index_single_markdown_file(
         }));
     }
 
-    let embedder = ctx.get_embedder().await;
-    let db_path = filepath.replace('\\', "/");
+    let embedder = ctx
+        .get_embedder()
+        .await
+        .map_err(|e| McpError::internal_error(e, None))?;
+    let db_path = normalize_db_path(path);
     let db = ctx.db.clone();
 
     tokio::task::spawn_blocking(move || {
@@ -809,12 +904,15 @@ async fn index_single_markdown_file(
     }))
 }
 
-/// Index a single code file (parse AST + embed + insert).
+/// Index a single code file (parse AST + embed + insert + relations).
 async fn index_single_code_file(
     path: &Path,
-    filepath: &str,
+    _filepath: &str,
     ctx: &McpContext,
 ) -> Result<(), McpError> {
+    use crate::indexer::code_parser::CodeParser;
+    use crate::indexer::core::store_code_file_relations;
+
     let mut parser = CodeParser::new()
         .map_err(|e| McpError::internal_error(format!("parser init: {e}"), None))?;
 
@@ -826,9 +924,15 @@ async fn index_single_code_file(
         return Ok(());
     }
 
-    let embedder = ctx.get_embedder().await;
-    let db_path = filepath.replace('\\', "/");
+    let embedder = ctx
+        .get_embedder()
+        .await
+        .map_err(|e| McpError::internal_error(e, None))?;
+    let db_path = normalize_db_path(path);
     let db = ctx.db.clone();
+
+    let path_for_rels = path.to_path_buf();
+    let db_path_for_rels = db_path.clone();
 
     tokio::task::spawn_blocking(move || {
         let text_refs: Vec<String> = code_chunks.iter().map(|c| c.get_embedding_text()).collect();
@@ -857,8 +961,18 @@ async fn index_single_code_file(
             })
             .collect();
 
-        db.insert_code_document(&db_path, chrono::Utc::now(), &db_chunks, &vectors)
+        let chunk_ids = db
+            .insert_code_document(&db_path, chrono::Utc::now(), &db_chunks, &vectors)
             .map_err(|e| McpError::internal_error(format!("DB insert failed: {e}"), None))?;
+
+        store_code_file_relations(
+            &db,
+            &path_for_rels,
+            &db_path_for_rels,
+            &code_chunks,
+            &chunk_ids,
+        )
+        .map_err(|e| McpError::internal_error(format!("relation insert failed: {e}"), None))?;
 
         Ok::<_, McpError>(())
     })
@@ -884,8 +998,11 @@ async fn index_single_text_file(
         }));
     }
 
-    let embedder = ctx.get_embedder().await;
-    let db_path = filepath.replace('\\', "/");
+    let embedder = ctx
+        .get_embedder()
+        .await
+        .map_err(|e| McpError::internal_error(e, None))?;
+    let db_path = normalize_db_path(path);
     let db = ctx.db.clone();
 
     tokio::task::spawn_blocking(move || {

@@ -153,14 +153,15 @@ impl Db {
         conn.query_row("SELECT COUNT(*) FROM word_mapping", [], |row| row.get(0))
     }
 
-    /// Inserts or updates a code document with its chunks, vectors, and metadata
+    /// Inserts or updates a code document with its chunks, vectors, and metadata.
+    /// Returns the inserted chunk IDs (aligned with `chunks`).
     pub fn insert_code_document(
         &self,
         filename: &str,
         modified_at: DateTime<Utc>,
         chunks: &[CodeChunk<'_>],
         embeddings: &[Vec<f32>],
-    ) -> Result<()> {
+    ) -> Result<Vec<i64>> {
         let mut conn = self.get_conn()?;
         if chunks.len() != embeddings.len() {
             return Err(rusqlite::Error::SqliteFailure(
@@ -209,7 +210,7 @@ impl Db {
         }
 
         tx.commit()?;
-        Ok(())
+        Ok(chunk_ids)
     }
 }
 

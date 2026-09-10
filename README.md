@@ -8,15 +8,15 @@
 
 A high-performance RAG (Retrieval-Augmented Generation) MCP Server written in Rust.
 
-> **40× token reduction** — indexes your codebase and documents, retrieves only the most relevant context for AI assistants via 1024-dimensional semantic vectors.
+> **40× token reduction** — indexes your codebase and documents, retrieves only the most relevant context for AI assistants via configurable semantic vectors (default 1024-dim).
 
 ---
 
-## Latest Release (v3.0.0)
+## Latest Release (v3.1.0)
 
-v3.0.0 is a major refactoring release that replaces the local ONNX inference engine with an **OpenAI-compatible Embedding API** backend, delivering higher retrieval precision and dramatically simpler deployment.
+v3.1.0 hardens the v3.0.0 Embedding API rewrite: code relations are wired end-to-end, ESM/CJS variants index correctly, vector search uses sqlite-vec KNN, and embedder failures no longer silently degrade.
 
-### Highlights
+### v3.0.0 Highlights (API rewrite)
 
 - **API-based Embedding** — Switched from local ONNX model (~235MB download, ~500MB memory) to any OpenAI-compatible `/v1/embeddings` API. Supports DashScope, Ollama, OpenAI, Azure OpenAI, and more.
 - **1024-Dimensional Vectors** — Upgraded from 384-dim to 1024-dim (float32), significantly improving semantic search precision.
@@ -35,7 +35,11 @@ This is a **breaking change**. To migrate:
 1. Delete the old `vectors.db` (schema incompatible — 384 vs 1024 dimensions)
 2. Update `config.json` to include the new `embedding` section (see [Quick Start](#2-configure))
 3. Set your API key via config or environment variable (`RAG_API_KEY`, `DASHSCOPE_API_KEY`, or `OPENAI_API_KEY`)
-4. Remove `compute` and `model` sections from config (no longer used)
+4. Remove `compute` and `model` sections from config (no longer used; ignored since v3.1.0)
+
+### Upgrading from v3.0.0 to v3.1.0
+
+Usually **no** `vectors.db` wipe is required. Keep `embedding.dimensions` consistent with the DB; a mismatch fails fast at startup.
 
 [📋 Full changelog](CHANGELOG.md)
 
@@ -45,10 +49,11 @@ This is a **breaking change**. To migrate:
 
 - **7 MCP Tools** — search, index, list_documents, manage_document, frontmatter, search_relations, build_dictionary
 - **28 Supported Formats** — Code (Rust, Go, Python, TypeScript, JavaScript, +ESM/CJS variants), Markdown, plain text, structured data (JSON, YAML, TOML, CSV), HTML, PDF, DOCX, spreadsheets
-- **1024-Dim Vector Search** — SQLite + sqlite-vec with float32 precision for high-quality semantic retrieval
-- **Code Intelligence** — Tree-sitter AST parsing for Rust, Go, Python, TypeScript, JavaScript
-- **Multilingual Dictionary** — CJK↔English symbol mapping extraction
+- **KNN Vector Search** — SQLite + sqlite-vec, configurable `float32` dimensions (default 1024)
+- **Code Intelligence** — Tree-sitter AST chunking + calls/imports/inherits relation extraction
+- **Multilingual Dictionary** — CJK↔English symbol mapping (including comment-adjacent symbols)
 - **Any OpenAI-Compatible API** — DashScope, Ollama (local), OpenAI, Azure OpenAI, DeepSeek, SiliconFlow
+- **Path Allowlist** — MCP file tools restricted to `document_patterns` base directories
 - **High Concurrency** — Async background syncing with robust pagination for 10k+ files
 - **Cross-Platform** — macOS (Intel/ARM), Linux (x64/ARM64), Windows (x64)
 
@@ -116,7 +121,7 @@ export OPENAI_API_KEY="sk-your-api-key"
 | DeepSeek | `https://api.deepseek.com/v1/embeddings` | `deepseek-embedding` | 1024 |
 | SiliconFlow | `https://api.siliconflow.cn/v1/embeddings` | `BAAI/bge-large-zh-v1.5` | 1024 |
 
-> **Note**: When switching providers, update `dimensions` to match the model output and delete the existing `vectors.db` (schema must match).
+> **Note**: When switching providers, update `dimensions` to match the model output and delete the existing `vectors.db` (schema is created from `dimensions` on open and checked via `system_metadata`; a mismatch refuses to start).
 
 ### 3. Add to MCP Client
 

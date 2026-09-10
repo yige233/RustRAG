@@ -14,6 +14,8 @@ pub struct Metadata {
     pub language: String,
     pub tags: Vec<String>,
     pub project: String,
+    /// Unknown keys preserved as-is so update does not drop user data.
+    pub extra: Vec<(String, String)>,
 }
 
 /// Parse frontmatter from markdown content. Returns `(Option<Metadata>, body)`.
@@ -63,7 +65,9 @@ pub fn parse(content: &str) -> Result<(Option<Metadata>, String)> {
                         .filter(|t| !t.is_empty())
                         .collect();
                 }
-                _ => {}
+                other => {
+                    metadata.extra.push((other.to_string(), value.to_string()));
+                }
             }
         }
     }
@@ -112,6 +116,9 @@ pub fn generate(metadata: &Metadata) -> String {
     if !metadata.project.is_empty() {
         builder.push_str(&format!("project: {}\n", yaml_quote(&metadata.project)));
     }
+    for (key, value) in &metadata.extra {
+        builder.push_str(&format!("{key}: {value}\n"));
+    }
 
     builder.push_str("---\n");
     builder
@@ -158,6 +165,14 @@ pub fn update_frontmatter(file_path: &Path, metadata: &Metadata) -> Result<()> {
             }
             if !metadata.project.is_empty() {
                 existing.project = metadata.project.clone();
+            }
+            // Preserve existing extras; overwrite keys that the update also sets
+            for (k, v) in &metadata.extra {
+                if let Some(slot) = existing.extra.iter_mut().find(|(ek, _)| ek == k) {
+                    slot.1 = v.clone();
+                } else {
+                    existing.extra.push((k.clone(), v.clone()));
+                }
             }
             existing
         }
@@ -206,6 +221,7 @@ mod tests {
             language: "typescript".into(),
             tags: vec!["ui".into(), "react".into()],
             project: "myapp".into(),
+            extra: vec![],
         };
         let fm = generate(&meta);
         assert!(fm.starts_with("---\n"));
@@ -264,7 +280,7 @@ mod tests {
     #[test]
     fn test_update_adds_when_none_exists() {
         let mut temp = tempfile::NamedTempFile::new().unwrap();
-        write!(temp, "# Doc\n").unwrap();
+        writeln!(temp, "# Doc").unwrap();
 
         let meta = Metadata {
             domain: "new".into(),

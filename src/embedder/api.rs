@@ -6,6 +6,8 @@
 /// Features:
 /// - Smart batching (adapts batch size to text length)
 /// - Exponential backoff retry (up to 3 attempts for retryable errors)
+/// - Concurrent batch processing bounded by `max_concurrent`
+use std::sync::Mutex;
 use std::time::Duration;
 
 use reqwest::blocking::Client;
@@ -32,6 +34,7 @@ pub struct ApiEmbedder {
     model: String,
     dimensions: usize,
     batch_size: usize,
+    max_concurrent: usize,
 }
 
 #[derive(Serialize)]
@@ -100,6 +103,7 @@ impl ApiEmbedder {
             model: config.api_model.clone(),
             dimensions: config.dimensions,
             batch_size: config.batch_size,
+            max_concurrent: config.max_concurrent.max(1),
         })
     }
 
@@ -287,13 +291,42 @@ impl super::Embedder for ApiEmbedder {
         debug!(
             total_texts = texts.len(),
             batch_count = batches.len(),
+            max_concurrent = self.max_concurrent,
             "Processing embedding batches"
         );
 
+        // Process batches in waves of up to max_concurrent, preserving order.
+        type BatchSlot = Option<Result<Vec<Vec<f32>>, EmbedderError>>;
+        let results: Mutex<Vec<BatchSlot>> = Mutex::new(batches.iter().map(|_| None).collect());
+
+        std::thread::scope(|scope| {
+            for wave_start in (0..batches.len()).step_by(self.max_concurrent) {
+                let wave_end = (wave_start + self.max_concurrent).min(batches.len());
+                let mut handles = Vec::with_capacity(wave_end - wave_start);
+                for (idx, batch) in batches.iter().enumerate().take(wave_end).skip(wave_start) {
+                    let results_ref = &results;
+                    handles.push(scope.spawn(move || {
+                        let out = self.process_batch(batch);
+                        results_ref.lock().unwrap()[idx] = Some(out);
+                    }));
+                }
+                for handle in handles {
+                    let _ = handle.join();
+                }
+            }
+        });
+
         let mut all_embeddings = Vec::with_capacity(texts.len());
-        for batch in &batches {
-            let embeddings = self.process_batch(batch)?;
-            all_embeddings.extend(embeddings);
+        for slot in results.into_inner().unwrap() {
+            match slot {
+                Some(Ok(emb)) => all_embeddings.extend(emb),
+                Some(Err(e)) => return Err(e),
+                None => {
+                    return Err(EmbedderError::InferenceFailed(
+                        "missing batch result".to_string(),
+                    ));
+                }
+            }
         }
 
         Ok(all_embeddings)
@@ -324,6 +357,7 @@ mod tests {
             model: "test-model".to_string(),
             dimensions: 1024,
             batch_size: 32,
+            max_concurrent: 1,
         }
     }
 
@@ -335,6 +369,7 @@ mod tests {
             model: "test-model".to_string(),
             dimensions: 1024,
             batch_size,
+            max_concurrent: 1,
         }
     }
 

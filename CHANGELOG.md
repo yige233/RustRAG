@@ -6,6 +6,56 @@ All notable releases of RustRAG.
 
 ---
 
+## v3.1.0 — Correctness & Concurrency Hardening
+
+Systematic fix pass over the v3.0.0 review findings: wire up code relations, harden search/security, and clean dead config.
+
+### Features
+
+- **Code relations work end-to-end**: calls / imports / inherits extracted at index time into `code_relations`; `search_relations` is no longer empty. Edges attributed to the **innermost** symbol (no class/method double-count).
+- **ESM/CJS variants indexable**: `.mjs` / `.cjs` / `.mts` / `.cts` route as Code (previously allowlisted but always `failed`).
+- **Vector KNN search**: sqlite-vec `embedding MATCH ... k = N`; filters over-fetch then LIMIT (no full-table distance sort).
+- **`embedding.max_concurrent` implemented**: wave-parallel Embedding API requests.
+- **Dictionary second pass**: `build_dictionary` also mines Chinese comments near symbols.
+
+### Reliability
+
+- Embedder init failure **no longer silently falls back to Mock** — tools return a clear error.
+- `manage_document` delete of a missing document returns failure (was fake success).
+- `Db::open` builds schema from configured dimensions and validates against metadata + existing `vec_chunks` schema; mismatch refuses to start.
+- Single-file index shares path normalization with directory sync.
+- Data-dir create failure exits; batch index returns per-file error details.
+
+### Security
+
+- MCP `index` / `frontmatter` paths restricted to `document_patterns` base dirs (Windows compared case-insensitively).
+- Missing frontmatter target reports `file not found` first.
+
+### Cleanup
+
+- Removed deprecated `compute` / `model` config sections (old JSON keys ignored).
+- Updater cache uses `data_dir` (was incorrectly using `db_path` file path).
+- HTTP log matches bind (`127.0.0.1`); PDF extract page cap 500.
+- `bin/query` takes CLI args; architecture docs synced to API Embedder.
+
+### Migration
+
+v3.0.0 → v3.1.0 usually needs **no** `vectors.db` wipe (still 1024-dim). If you used another `dimensions`, keep config consistent or delete the DB. `compute` / `model` keys may be removed or left ignored.
+
+---
+
+## v3.0.0 — Embedding API Rewrite
+
+Replaced the local ONNX runtime with an **OpenAI-compatible Embedding API** backend.
+
+- API embeddings (DashScope / Ollama / OpenAI / Azure OpenAI, …), default 1024-dim.
+- Second-level startup, ~50MB runtime memory; dropped `ort` / `tokenizers` / `bytemuck` / `indicatif`.
+- Smart batching + exponential backoff; data dir defaults to `~/.rustrag/`.
+
+**Breaking** (from v2.x): delete old `vectors.db`; switch to the `embedding` config section; drop `compute` / `model`.
+
+---
+
 ## v2.4.3 — sqlite-vec Init Order Fix
 
 Fixes the sqlite-vec auto-extension registration order — `sqlite3_auto_extension` is now called **before** `Connection::open()`, ensuring the extension is loaded on every connection in the r2d2 pool.

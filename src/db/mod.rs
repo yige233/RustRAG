@@ -10,7 +10,7 @@ pub mod models;
 pub mod relations;
 pub mod search;
 
-const SCHEMA_SQL: &str = r#"
+const SCHEMA_SQL_PREFIX: &str = r#"
 CREATE TABLE IF NOT EXISTS documents (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     filename TEXT NOT NULL UNIQUE,
@@ -29,11 +29,9 @@ CREATE TABLE IF NOT EXISTS chunks (
 );
 
 CREATE INDEX IF NOT EXISTS idx_document_id ON chunks(document_id);
+"#;
 
-CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(
-    embedding float32[1024]
-);
-
+const SCHEMA_SQL_SUFFIX: &str = r#"
 CREATE TABLE IF NOT EXISTS code_metadata (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chunk_id INTEGER NOT NULL UNIQUE,
@@ -78,7 +76,7 @@ CREATE TABLE IF NOT EXISTS word_mapping (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     source_word TEXT NOT NULL,
     target_word TEXT NOT NULL,
-    source_lang TEXT DEFAULT 'ja',
+    source_lang TEXT DEFAULT 'zh',
     confidence REAL DEFAULT 1.0,
     source_document TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -89,6 +87,16 @@ CREATE INDEX IF NOT EXISTS idx_word_source ON word_mapping(source_word);
 CREATE INDEX IF NOT EXISTS idx_word_target ON word_mapping(target_word);
 CREATE INDEX IF NOT EXISTS idx_word_lang ON word_mapping(source_lang);
 "#;
+
+/// Build the full schema SQL for a given vector dimension.
+fn schema_sql(dimensions: usize) -> String {
+    format!(
+        "{SCHEMA_SQL_PREFIX}\nCREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(\n    embedding float32[{dimensions}]\n);\n{SCHEMA_SQL_SUFFIX}"
+    )
+}
+
+/// Default vector dimension when not specified (matches DashScope text-embedding-v4 default).
+pub const DEFAULT_VEC_DIMENSIONS: usize = 1024;
 
 static INIT_VEC: Once = Once::new();
 
@@ -133,9 +141,6 @@ impl ManageConnection for SqliteManager {
              PRAGMA synchronous = NORMAL;",
         )?;
 
-        // Verification
-        let vec_version: String = conn.query_row("SELECT vec_version()", [], |row| row.get(0))?;
-        info!("sqlite-vec version: {}", vec_version);
         Ok(conn)
     }
 
@@ -161,10 +166,15 @@ impl Db {
         })
     }
 
-    /// Open a database connection pool at the given path and initialize the schema.
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+    /// Open a database connection pool at the given path and initialize the schema
+    /// with the configured vector dimension. Rejects mismatched existing databases.
+    pub fn open<P: AsRef<Path>>(path: P, dimensions: usize) -> Result<Self> {
         let path = path.as_ref();
-        info!("Initializing database: {}", path.display());
+        info!(
+            "Initializing database: {} (vec dim={})",
+            path.display(),
+            dimensions
+        );
 
         let manager = SqliteManager {
             path: Some(path.to_path_buf()),
@@ -180,7 +190,40 @@ impl Db {
         let conn = pool.get().map_err(|e| {
             rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(1), Some(e.to_string()))
         })?;
-        conn.execute_batch(SCHEMA_SQL)?;
+
+        // Detect sqlite-vec once at first open
+        if let Ok(ver) = conn.query_row("SELECT vec_version()", [], |row| row.get::<_, String>(0)) {
+            info!("sqlite-vec version: {ver}");
+        }
+
+        // Resolve the dimension of an already-created vec_chunks table (metadata first,
+        // then schema text). CREATE ... IF NOT EXISTS will not change an existing table,
+        // so a mismatch must fail before we pretend the open succeeded.
+        let meta_dim = stored_dimension(&conn)?;
+        let schema_dim = detect_existing_vec_dimensions(&conn)?;
+        let existing = meta_dim.or(schema_dim);
+
+        if let Some(existing) = existing {
+            if existing != dimensions {
+                return Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(1),
+                    Some(format!(
+                        "vector dimension mismatch: database was created with {existing} dims, \
+                         config requests {dimensions}. Delete vectors.db and re-index, or set \
+                         embedding.dimensions back to {existing}."
+                    )),
+                ));
+            }
+        }
+
+        conn.execute_batch(&schema_sql(dimensions))?;
+
+        if meta_dim.is_none() {
+            conn.execute(
+                "INSERT OR REPLACE INTO system_metadata (key, value) VALUES ('vec_dimensions', ?)",
+                [dimensions.to_string().as_str()],
+            )?;
+        }
 
         info!("Database initialized successfully");
 
@@ -211,6 +254,10 @@ impl Db {
     }
 
     pub fn open_in_memory() -> Result<Self> {
+        Self::open_in_memory_with_dim(DEFAULT_VEC_DIMENSIONS)
+    }
+
+    pub fn open_in_memory_with_dim(dimensions: usize) -> Result<Self> {
         let manager = SqliteManager { path: None };
         let pool = r2d2::Pool::builder()
             .max_size(1) // Single connection so all queries hit the initialized schema
@@ -222,7 +269,7 @@ impl Db {
         let conn = pool.get().map_err(|e| {
             rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(1), Some(e.to_string()))
         })?;
-        conn.execute_batch(SCHEMA_SQL)?;
+        conn.execute_batch(&schema_sql(dimensions))?;
         Ok(Self { pool })
     }
 }
@@ -234,6 +281,41 @@ pub fn serialize_vector_f32(vec: &[f32]) -> Vec<u8> {
         bytes.extend_from_slice(&v.to_le_bytes());
     }
     bytes
+}
+
+fn stored_dimension(conn: &Connection) -> Result<Option<usize>> {
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT value FROM system_metadata WHERE key = 'vec_dimensions'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    Ok(stored.and_then(|s| s.parse().ok()))
+}
+
+/// Parse `float32[N]` out of an existing `vec_chunks` CREATE statement.
+fn detect_existing_vec_dimensions(conn: &Connection) -> Result<Option<usize>> {
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'vec_chunks'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    let Some(sql) = sql else {
+        return Ok(None);
+    };
+    // e.g. ... embedding float32[1024] ...
+    let re_start = "float32[";
+    let Some(start) = sql.find(re_start) else {
+        return Ok(None);
+    };
+    let rest = &sql[start + re_start.len()..];
+    let Some(end) = rest.find(']') else {
+        return Ok(None);
+    };
+    Ok(rest[..end].parse().ok())
 }
 
 #[cfg(test)]
@@ -254,6 +336,32 @@ mod tests {
 
         // sqlite_master virtual tables might create multiple internal tables, but the main count should be 6
         assert_eq!(tables, 6);
+    }
+
+    #[test]
+    fn test_detect_existing_vec_dimensions_from_schema() {
+        let db = Db::open_in_memory_with_dim(768).unwrap();
+        let conn = db.get_conn().unwrap();
+        let dim = detect_existing_vec_dimensions(&conn).unwrap();
+        assert_eq!(dim, Some(768));
+    }
+
+    #[test]
+    fn test_open_rejects_dimension_mismatch_on_existing_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vec.db");
+        // Create a 768-dim DB
+        {
+            let _ = Db::open(&path, 768).expect("open 768");
+        }
+        // Re-open with 1024 must fail (schema already exists, no/old metadata)
+        let result = Db::open(&path, 1024);
+        assert!(result.is_err(), "dimension mismatch must be rejected");
+        let msg = format!("{:?}", result.err().unwrap());
+        assert!(
+            msg.contains("dimension mismatch") || msg.contains("768"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]

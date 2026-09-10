@@ -31,18 +31,19 @@ impl McpContext {
     }
 
     /// Get or lazily initialize the embedder.
-    /// On first call, creates the API embedder from config.
-    pub async fn get_embedder(&self) -> Arc<dyn Embedder> {
+    /// Returns an error if the API embedder cannot be created (no silent mock fallback
+    /// in production paths — callers should surface the error).
+    pub async fn get_embedder(&self) -> Result<Arc<dyn Embedder>, String> {
         let read_guard = self.embedder.read().await;
         if let Some(embedder) = read_guard.clone() {
-            return embedder;
+            return Ok(embedder);
         }
         drop(read_guard);
 
         let mut write_guard = self.embedder.write().await;
         // Double check after acquiring write lock
         if let Some(embedder) = write_guard.clone() {
-            return embedder;
+            return Ok(embedder);
         }
 
         tracing::info!("Initializing API embedder...");
@@ -56,15 +57,13 @@ impl McpContext {
                 );
                 let embedder_arc = Arc::new(e) as Arc<dyn Embedder>;
                 *write_guard = Some(embedder_arc.clone());
-                embedder_arc
+                Ok(embedder_arc)
             }
             Err(e) => {
-                tracing::warn!("API embedder unavailable: {e}");
-                tracing::warn!("Using mock embedder — search results will be meaningless");
-                let mock_arc =
-                    Arc::new(crate::embedder::mock::MockEmbedder::default()) as Arc<dyn Embedder>;
-                *write_guard = Some(mock_arc.clone());
-                mock_arc
+                tracing::error!("API embedder unavailable: {e}");
+                Err(format!(
+                    "embedding API unavailable: {e}. Set embedding.api_key or RAG_API_KEY / DASHSCOPE_API_KEY / OPENAI_API_KEY."
+                ))
             }
         }
     }
@@ -143,7 +142,7 @@ impl McpServer {
 
     /// Start the MCP server on streamable HTTP transport.
     pub async fn start_http(self, port: u16) -> Result<()> {
-        tracing::info!("Starting MCP server on http://0.0.0.0:{}...", port);
+        tracing::info!("Starting MCP server on http://127.0.0.1:{}...", port);
 
         use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
         use rmcp::transport::streamable_http_server::tower::{

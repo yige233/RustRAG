@@ -8,6 +8,9 @@ use super::markdown::{self, Chunk};
 /// Maximum rows per sheet for spreadsheet extraction to prevent memory issues.
 const MAX_SPREADSHEET_ROWS: usize = 10_000;
 
+/// Maximum pages extracted from a PDF to prevent OOM on huge documents.
+const MAX_PDF_PAGES: usize = 500;
+
 /// Entry point: extract text from a file and split into chunks.
 /// Dispatches by file extension to format-specific handlers.
 pub fn extract_and_chunk(path: &Path, chunk_size: usize) -> Result<Vec<Chunk>> {
@@ -264,10 +267,19 @@ fn extract_html(path: &Path) -> Result<String> {
 fn extract_pdf(path: &Path) -> Result<String> {
     let doc = lopdf::Document::load(path)?;
     let pages = doc.get_pages();
-    let page_numbers: Vec<u32> = pages.keys().copied().collect();
+    let mut page_numbers: Vec<u32> = pages.keys().copied().collect();
+    page_numbers.sort_unstable();
 
     if page_numbers.is_empty() {
         return Ok(String::new());
+    }
+
+    if page_numbers.len() > MAX_PDF_PAGES {
+        warn!(
+            "PDF has {} pages, extracting only first {MAX_PDF_PAGES}",
+            page_numbers.len()
+        );
+        page_numbers.truncate(MAX_PDF_PAGES);
     }
 
     let text = doc.extract_text(&page_numbers)?;

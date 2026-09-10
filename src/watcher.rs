@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Starts the file system watcher in the background.
 pub async fn start_watcher(ctx: McpContext) {
@@ -197,14 +197,24 @@ async fn process_file_change(path: &Path, ctx: &McpContext) {
         // File was removed
         tracing::info!("File removed, deleting from index: {}", db_path);
         let db = ctx.db.clone();
-        let _ = db.delete_document(&db_path);
+        match db.delete_document(&db_path) {
+            Ok(true) => info!("Deleted from index: {}", db_path),
+            Ok(false) => debug!("Not in index (already gone?): {}", db_path),
+            Err(e) => error!("Failed to delete {db_path} from index: {e}"),
+        }
         return;
     }
 
     // File was created or modified -> Reindex
     info!("File changed, reindexing: {}", db_path);
 
-    let embedder = ctx.get_embedder().await;
+    let embedder = match ctx.get_embedder().await {
+        Ok(e) => e,
+        Err(e) => {
+            error!("Cannot reindex {db_path}: {e}");
+            return;
+        }
+    };
     let indexer = Indexer::new(
         ctx.db.clone(),
         embedder.as_ref(),

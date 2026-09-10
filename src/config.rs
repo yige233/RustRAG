@@ -5,9 +5,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-/// The vector dimension required by the sqlite-vec schema (vec_chunks float32[N]).
-const SCHEMA_VEC_DIMENSIONS: usize = 1024;
-
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -57,18 +54,6 @@ fn default_chunk_size() -> usize {
 
 fn default_search_top_k() -> usize {
     5
-}
-
-fn default_device() -> String {
-    "auto".to_string()
-}
-
-fn default_true() -> bool {
-    true
-}
-
-fn default_model_name() -> String {
-    "multilingual-e5-small".to_string()
 }
 
 fn default_dimensions() -> usize {
@@ -148,36 +133,9 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_check: Option<bool>,
 
-    #[serde(default)]
-    pub compute: ComputeConfig,
-
-    #[serde(default)]
-    pub model: ModelConfig,
-
     /// Embedding API configuration (DashScope / OpenAI-compatible).
     #[serde(default)]
     pub embedding: EmbeddingConfig,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct ComputeConfig {
-    #[serde(default = "default_device")]
-    pub device: String,
-
-    #[serde(default = "default_true")]
-    pub fallback_to_cpu: bool,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-pub struct ModelConfig {
-    #[serde(default = "default_model_name")]
-    pub name: String,
-
-    #[serde(default = "default_dimensions")]
-    pub dimensions: usize,
-
-    #[serde(default = "default_batch_size")]
-    pub batch_size: usize,
 }
 
 /// Configuration for OpenAI-compatible embedding API.
@@ -206,7 +164,7 @@ pub struct EmbeddingConfig {
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
 
-    /// Maximum concurrent API requests (semaphore limit).
+    /// Maximum concurrent API requests.
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: usize,
 
@@ -247,28 +205,7 @@ impl Default for Config {
             chunk_size: default_chunk_size(),
             search_top_k: default_search_top_k(),
             update_check: None,
-            compute: ComputeConfig::default(),
-            model: ModelConfig::default(),
             embedding: EmbeddingConfig::default(),
-        }
-    }
-}
-
-impl Default for ComputeConfig {
-    fn default() -> Self {
-        Self {
-            device: default_device(),
-            fallback_to_cpu: default_true(),
-        }
-    }
-}
-
-impl Default for ModelConfig {
-    fn default() -> Self {
-        Self {
-            name: default_model_name(),
-            dimensions: default_dimensions(),
-            batch_size: default_batch_size(),
         }
     }
 }
@@ -373,12 +310,6 @@ impl Config {
             "embedding.dimensions must be positive"
         );
         anyhow::ensure!(
-            self.embedding.dimensions == SCHEMA_VEC_DIMENSIONS,
-            "embedding.dimensions ({}) must match the sqlite-vec schema dimension ({})",
-            self.embedding.dimensions,
-            SCHEMA_VEC_DIMENSIONS
-        );
-        anyhow::ensure!(
             self.embedding.batch_size > 0,
             "embedding.batch_size must be positive"
         );
@@ -435,6 +366,33 @@ impl Config {
 
         dirs.into_iter().collect()
     }
+
+    /// Whether `path` lies under one of the configured document base directories.
+    /// Used by MCP tools to reject arbitrary filesystem access.
+    #[must_use]
+    pub fn is_path_allowed(&self, path: &Path) -> bool {
+        let Ok(canon) = path.canonicalize() else {
+            return false;
+        };
+        let canon_str = normalize_path_for_compare(&canon.to_string_lossy());
+        self.get_base_directories().iter().any(|base| {
+            let base_str = normalize_path_for_compare(&base.to_string_lossy());
+            canon_str == base_str || canon_str.starts_with(&format!("{base_str}/"))
+        })
+    }
+}
+
+/// Normalize a path string for prefix comparison: strip Windows UNC, unify separators,
+/// and case-fold on Windows (paths are case-insensitive there).
+fn normalize_path_for_compare(path: &str) -> String {
+    let mut s = path.replace('\\', "/");
+    if let Some(stripped) = s.strip_prefix("//?/") {
+        s = stripped.to_string();
+    }
+    if cfg!(windows) {
+        s = s.to_lowercase();
+    }
+    s
 }
 
 // ── Pattern helpers ──────────────────────────────────────────────────
@@ -639,7 +597,19 @@ mod tests {
         let parsed: Config = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.chunk_size, config.chunk_size);
         assert_eq!(parsed.db_path, config.db_path);
-        assert_eq!(parsed.model.name, config.model.name);
+        assert_eq!(parsed.embedding.api_model, config.embedding.api_model);
+    }
+
+    #[test]
+    fn test_legacy_compute_model_sections_ignored() {
+        let json = r#"{
+            "compute": {"device": "cuda"},
+            "model": {"name": "old", "dimensions": 384},
+            "embedding": {"api_model": "text-embedding-v4", "dimensions": 1024}
+        }"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.embedding.dimensions, 1024);
+        assert!(config.validate().is_ok());
     }
 
     #[test]

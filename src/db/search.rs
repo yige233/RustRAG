@@ -80,7 +80,11 @@ impl Db {
         self.search_with_filter(query_vector, top_k, None)
     }
 
-    /// Perform vector similarity search with optional filtering
+    /// Perform vector similarity search with optional filtering.
+    ///
+    /// Uses sqlite-vec KNN (`embedding MATCH ... k = N`) as the candidate
+    /// generator. When path filters are present, over-fetch then filter so the
+    /// final result still has up to `top_k` hits.
     pub fn search_with_filter(
         &self,
         query_vector: &[f32],
@@ -88,6 +92,15 @@ impl Db {
         filter: Option<&SearchFilter<'_>>,
     ) -> Result<Vec<SearchResult>> {
         let conn = self.get_conn()?;
+        let blob = serialize_vector_f32(query_vector);
+
+        // Over-fetch when filtering so post-filter LIMIT still fills top_k
+        let knn_k = if filter.is_some() {
+            (top_k.saturating_mul(20)).max(100) as i64
+        } else {
+            top_k.max(1) as i64
+        };
+
         let mut query = String::from(
             r#"
             SELECT
@@ -95,7 +108,7 @@ impl Db {
                 c.content,
                 c.position,
                 c.id as chunk_id,
-                vec_distance_cosine(v.embedding, ?) as distance,
+                v.distance as distance,
                 cm.symbol_name,
                 cm.symbol_type,
                 cm.language,
@@ -103,15 +116,19 @@ impl Db {
                 cm.end_line,
                 cm.parent_symbol,
                 cm.signature
-            FROM vec_chunks v
+            FROM (
+                SELECT rowid, distance
+                FROM vec_chunks
+                WHERE embedding MATCH ? AND k = ?
+            ) v
             JOIN chunks c ON v.rowid = c.id
             JOIN documents d ON c.document_id = d.id
             LEFT JOIN code_metadata cm ON c.id = cm.chunk_id
             "#,
         );
 
+        let mut params: Vec<Value> = vec![Value::Blob(blob), Value::Integer(knn_k)];
         let mut where_clauses = Vec::new();
-        let mut params: Vec<Value> = vec![Value::Blob(serialize_vector_f32(query_vector))];
 
         if let Some(f) = filter {
             if let Some(dir) = f.directory {
