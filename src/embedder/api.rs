@@ -190,10 +190,16 @@ impl ApiEmbedder {
 
     /// Process a single batch with retry logic.
     fn process_batch(&self, batch: &[&str]) -> Result<Vec<Vec<f32>>, EmbedderError> {
+        let dimensions = if self.api_url.contains("siliconflow") {
+            None
+        } else {
+            Some(self.dimensions)
+        };
+
         let request = EmbeddingRequest {
             model: self.model.clone(),
             input: batch.iter().map(|s| s.to_string()).collect(),
-            dimensions: Some(self.dimensions),
+            dimensions,
         };
 
         // Exponential backoff retry
