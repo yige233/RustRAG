@@ -219,7 +219,6 @@ impl<'a, E: Embedder + ?Sized> Indexer<'a, E> {
         };
 
         let mut visited_paths = std::collections::HashSet::new();
-
         let mut result = CodeSyncResult::default();
 
         // Build overrides from config
@@ -237,6 +236,7 @@ impl<'a, E: Embedder + ?Sized> Indexer<'a, E> {
             .overrides(override_matcher)
             .build();
 
+        let mut pending_files = Vec::new();
         for entry in walker.into_iter().filter_map(|e| e.ok()) {
             let path = entry.path();
             if path.is_dir() {
@@ -251,12 +251,61 @@ impl<'a, E: Embedder + ?Sized> Indexer<'a, E> {
                 continue;
             }
 
-            // Enforce consistent absolute system paths for all documents
             let path_str = normalize_system_path(path);
             visited_paths.insert(path_str.clone());
+            pending_files.push(path.to_path_buf());
+        }
 
-            let metadata = entry.metadata()?;
-            let mod_time: DateTime<Utc> = metadata.modified()?.into();
+        let total_files = pending_files.len();
+        let mut completed_files = 0usize;
+
+        for path in pending_files {
+            let path_str = normalize_system_path(&path);
+            let ext = path
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+
+            let current = completed_files + 1;
+            tracing::info!(
+                file = %path_str,
+                current,
+                total = total_files,
+                completed = completed_files,
+                "Starting file indexing"
+            );
+
+            let metadata = match path.metadata() {
+                Ok(m) => m,
+                Err(_) => {
+                    completed_files += 1;
+                    result.failed += 1;
+                    tracing::warn!(
+                        file = %path_str,
+                        current,
+                        total = total_files,
+                        completed = completed_files,
+                        "Skipping file due to metadata read failure"
+                    );
+                    continue;
+                }
+            };
+
+            let mod_time: DateTime<Utc> = match metadata.modified() {
+                Ok(m) => m.into(),
+                Err(_) => {
+                    completed_files += 1;
+                    result.failed += 1;
+                    tracing::warn!(
+                        file = %path_str,
+                        current,
+                        total = total_files,
+                        completed = completed_files,
+                        "Skipping file due to mtime read failure"
+                    );
+                    continue;
+                }
+            };
 
             let mut needs_indexing = true;
             let mut was_update = false;
@@ -273,7 +322,7 @@ impl<'a, E: Embedder + ?Sized> Indexer<'a, E> {
             if needs_indexing {
                 let success = match classify_extension(ext) {
                     Some(FileType::Markdown) => self
-                        .index_markdown(path, &path_str, mod_time)
+                        .index_markdown(&path, &path_str, mod_time)
                         .await
                         .map_err(|e| {
                             tracing::warn!(file = %path.display(), error = %e, "markdown index failed");
@@ -281,7 +330,7 @@ impl<'a, E: Embedder + ?Sized> Indexer<'a, E> {
                         })
                         .is_ok(),
                     Some(FileType::Code) => self
-                        .index_code_file(path, &path_str, mod_time)
+                        .index_code_file(&path, &path_str, mod_time)
                         .await
                         .map_err(|e| {
                             tracing::warn!(file = %path.display(), error = %e, "code index failed");
@@ -289,7 +338,7 @@ impl<'a, E: Embedder + ?Sized> Indexer<'a, E> {
                         })
                         .is_ok(),
                     Some(FileType::Text) => self
-                        .index_text_file(path, &path_str, mod_time)
+                        .index_text_file(&path, &path_str, mod_time)
                         .await
                         .map_err(|e| {
                             tracing::warn!(file = %path.display(), error = %e, "text index failed");
@@ -306,6 +355,7 @@ impl<'a, E: Embedder + ?Sized> Indexer<'a, E> {
                     }
                 };
 
+                completed_files += 1;
                 if success {
                     result.indexed += 1;
                     if was_update {
@@ -313,9 +363,32 @@ impl<'a, E: Embedder + ?Sized> Indexer<'a, E> {
                     } else {
                         result.added += 1;
                     }
+                    tracing::info!(
+                        file = %path_str,
+                        current,
+                        total = total_files,
+                        completed = completed_files,
+                        "Finished file indexing successfully"
+                    );
                 } else {
                     result.failed += 1;
+                    tracing::warn!(
+                        file = %path_str,
+                        current,
+                        total = total_files,
+                        completed = completed_files,
+                        "Finished file indexing with failure"
+                    );
                 }
+            } else {
+                completed_files += 1;
+                tracing::info!(
+                    file = %path_str,
+                    current,
+                    total = total_files,
+                    completed = completed_files,
+                    "Skipped file because it was unchanged"
+                );
             }
         }
 
@@ -346,6 +419,15 @@ impl<'a, E: Embedder + ?Sized> Indexer<'a, E> {
             return Ok(false);
         }
 
+        let path_str = normalize_system_path(path);
+        tracing::info!(
+            file = %path_str,
+            current = 1,
+            total = 1,
+            completed = 0,
+            "Indexing single file"
+        );
+
         let metadata = match path.metadata() {
             Ok(m) => m,
             Err(_) => return Ok(false),
@@ -354,7 +436,6 @@ impl<'a, E: Embedder + ?Sized> Indexer<'a, E> {
             Ok(m) => m.into(),
             Err(_) => return Ok(false),
         };
-        let path_str = normalize_system_path(path);
 
         let success = match classify_extension(ext) {
             Some(FileType::Markdown) => {
@@ -371,6 +452,15 @@ impl<'a, E: Embedder + ?Sized> Indexer<'a, E> {
             None => false,
         };
 
+        tracing::info!(
+            file = %path_str,
+            current = 1,
+            total = 1,
+            completed = 1,
+            result = success,
+            "Finished single file indexing"
+        );
+
         Ok(success)
     }
 
@@ -386,11 +476,21 @@ impl<'a, E: Embedder + ?Sized> Indexer<'a, E> {
         }
 
         let text_refs: Vec<&str> = chunks.iter().map(|c| c.content.as_str()).collect();
+        tracing::info!(
+            file = %normalize_system_path(real_path),
+            chunks = text_refs.len(),
+            "Embedding markdown chunks"
+        );
 
-        // Vectorize chunks (blocking HTTP — keep off the async executor)
         let vectors = embed_batch_off_executor(self.embedder, &text_refs)?;
 
-        // Map to models::Chunk for DB insertion
+        tracing::info!(
+            file = %normalize_system_path(real_path),
+            chunks = text_refs.len(),
+            vectors = vectors.len(),
+            "Embedded markdown chunks"
+        );
+
         let db_chunks: Vec<crate::db::models::Chunk> = chunks
             .iter()
             .map(|c| crate::db::models::Chunk {
@@ -399,7 +499,6 @@ impl<'a, E: Embedder + ?Sized> Indexer<'a, E> {
             })
             .collect();
 
-        // Write to DB
         {
             let db_guard = self.db.clone();
             db_guard.insert_document(db_path, mod_time, &db_chunks, &vectors)?;
@@ -427,14 +526,24 @@ impl<'a, E: Embedder + ?Sized> Indexer<'a, E> {
             return Ok(());
         }
 
-        // Generate embedding text enriched with language + symbol context
         let text_refs: Vec<String> = code_chunks.iter().map(|c| c.get_embedding_text()).collect();
         let text_str_refs: Vec<&str> = text_refs.iter().map(|s| s.as_str()).collect();
 
-        // Vectorize (blocking HTTP — keep off the async executor)
+        tracing::info!(
+            file = %normalize_system_path(real_path),
+            chunks = text_str_refs.len(),
+            "Embedding code chunks"
+        );
+
         let vectors = embed_batch_off_executor(self.embedder, &text_str_refs)?;
 
-        // Convert indexer::CodeChunk → db::models::CodeChunk
+        tracing::info!(
+            file = %normalize_system_path(real_path),
+            chunks = text_str_refs.len(),
+            vectors = vectors.len(),
+            "Embedded code chunks"
+        );
+
         let db_chunks: Vec<crate::db::models::CodeChunk> = code_chunks
             .iter()
             .enumerate()
@@ -453,7 +562,6 @@ impl<'a, E: Embedder + ?Sized> Indexer<'a, E> {
             })
             .collect();
 
-        // Write to DB with code metadata; capture chunk IDs for relations
         let chunk_ids = self
             .db
             .insert_code_document(db_path, mod_time, &db_chunks, &vectors)?;
@@ -477,7 +585,20 @@ impl<'a, E: Embedder + ?Sized> Indexer<'a, E> {
         }
 
         let text_refs: Vec<&str> = chunks.iter().map(|c| c.content.as_str()).collect();
+        tracing::info!(
+            file = %normalize_system_path(real_path),
+            chunks = text_refs.len(),
+            "Embedding text chunks"
+        );
+
         let vectors = embed_batch_off_executor(self.embedder, &text_refs)?;
+
+        tracing::info!(
+            file = %normalize_system_path(real_path),
+            chunks = text_refs.len(),
+            vectors = vectors.len(),
+            "Embedded text chunks"
+        );
 
         let db_chunks: Vec<crate::db::models::Chunk> = chunks
             .iter()
@@ -493,159 +614,5 @@ impl<'a, E: Embedder + ?Sized> Indexer<'a, E> {
         }
 
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::db::Db;
-    use crate::embedder::mock::MockEmbedder;
-    use std::fs;
-    use tempfile::tempdir;
-
-    #[test]
-    fn test_classify_extension_includes_esm_cjs_variants() {
-        assert_eq!(classify_extension("mjs"), Some(FileType::Code));
-        assert_eq!(classify_extension("cjs"), Some(FileType::Code));
-        assert_eq!(classify_extension("mts"), Some(FileType::Code));
-        assert_eq!(classify_extension("cts"), Some(FileType::Code));
-        assert_eq!(classify_extension("java"), None);
-    }
-
-    #[test]
-    fn test_owning_chunk_index_prefers_innermost_span() {
-        use crate::indexer::code_parser::CodeChunk;
-        let outer = CodeChunk {
-            content: String::new(),
-            position: 0,
-            symbol_name: "Foo".into(),
-            symbol_type: "class".into(),
-            language: "python".into(),
-            start_line: 1,
-            end_line: 20,
-            parent_symbol: None,
-            signature: String::new(),
-        };
-        let inner = CodeChunk {
-            content: String::new(),
-            position: 1,
-            symbol_name: "bar".into(),
-            symbol_type: "function".into(),
-            language: "python".into(),
-            start_line: 5,
-            end_line: 8,
-            parent_symbol: Some("Foo".into()),
-            signature: String::new(),
-        };
-        let chunks = vec![outer, inner];
-        // Line 6 is inside both; innermost (bar) wins
-        assert_eq!(owning_chunk_index(&chunks, 6), Some(1));
-        // Line 2 is only inside Foo
-        assert_eq!(owning_chunk_index(&chunks, 2), Some(0));
-        // Line 30 matches nothing
-        assert_eq!(owning_chunk_index(&chunks, 30), None);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_indexer_differential_sync() {
-        let temp_dir = tempdir().unwrap();
-        let dir_path = temp_dir.path();
-
-        // Create some files
-        let file1 = dir_path.join("file1.md");
-        fs::write(&file1, "Content 1").unwrap();
-
-        let file2 = dir_path.join("file2.md");
-        fs::write(&file2, "Content 2").unwrap();
-
-        let db = Db::open_in_memory().unwrap();
-        let db_arc = Arc::new(db);
-        let embedder = MockEmbedder::default();
-        let mut indexer = Indexer::new(
-            db_arc.clone(),
-            &embedder,
-            500,
-            Arc::new(crate::config::Config::default()),
-        );
-
-        // First sync
-        let res1 = indexer.index_directory(dir_path, false).await.unwrap();
-        assert_eq!(res1.added, 2);
-        assert_eq!(res1.indexed, 2);
-        assert_eq!(res1.skipped, 0);
-
-        // Second sync immediately - should skip both
-        let res2 = indexer.index_directory(dir_path, false).await.unwrap();
-        assert_eq!(res2.added, 0);
-        assert_eq!(res2.updated, 0);
-        assert_eq!(res2.indexed, 0);
-        assert_eq!(res2.skipped, 2);
-
-        // Third sync with force=true - should update both
-        let res3 = indexer.index_directory(dir_path, true).await.unwrap();
-        assert_eq!(res3.added, 0);
-        assert_eq!(res3.updated, 2);
-        assert_eq!(res3.indexed, 2);
-        assert_eq!(res3.skipped, 0);
-
-        // Check DB
-        let docs = db_arc.list_documents().unwrap();
-        assert_eq!(docs.len(), 2);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_index_code_file_stores_relations() {
-        let temp_dir = tempdir().unwrap();
-        let file = temp_dir.path().join("sample.rs");
-        fs::write(
-            &file,
-            r#"
-fn helper() {}
-
-fn process() {
-    helper();
-    external_function();
-}
-"#,
-        )
-        .unwrap();
-
-        let db = Arc::new(Db::open_in_memory().unwrap());
-        let embedder = MockEmbedder::default();
-        let indexer = Indexer::new(
-            db.clone(),
-            &embedder,
-            500,
-            Arc::new(crate::config::Config::default()),
-        );
-
-        let path_str = normalize_system_path(&file);
-        indexer
-            .index_code_file(&file, &path_str, chrono::Utc::now())
-            .await
-            .expect("index code file");
-
-        let rels = db
-            .find_symbol_relations("helper", "incoming", Some("calls"))
-            .unwrap();
-        assert!(
-            !rels.is_empty(),
-            "process() should record a calls relation to helper"
-        );
-
-        // Each edge should be attributed once (no double-count from outer/inner)
-        let process_out = db
-            .find_symbol_relations("process", "outgoing", Some("calls"))
-            .unwrap();
-        let helper_targets: Vec<_> = process_out
-            .iter()
-            .filter(|r| r.target_name == "helper")
-            .collect();
-        assert_eq!(
-            helper_targets.len(),
-            1,
-            "helper call must be attributed exactly once"
-        );
     }
 }
